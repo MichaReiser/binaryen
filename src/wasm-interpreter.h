@@ -528,6 +528,191 @@ public:
   Flow visitHost(Host *curr) { WASM_UNREACHABLE(); }
 };
 
+// A function scope, containing values of locals
+class FunctionScope {
+ public:
+  std::vector<Literal> locals;
+  Function* function;
+
+  FunctionScope(Function* function, LiteralList& arguments)
+      : function(function) {
+    if (function->params.size() != arguments.size()) {
+      std::cerr << "Function `" << function->name << "` expects "
+                << function->params.size() << " parameters, got "
+                << arguments.size() << " arguments." << std::endl;
+      abort();
+    }
+    locals.resize(function->getNumLocals());
+    for (size_t i = 0; i < function->getNumLocals(); i++) {
+      if (i < arguments.size()) {
+        assert(function->isParam(i));
+        if (function->params[i] != arguments[i].type) {
+          std::cerr << "Function `" << function->name << "` expects type "
+                    << printWasmType(function->params[i])
+                    << " for parameter " << i << ", got "
+                    << printWasmType(arguments[i].type) << "." << std::endl;
+          abort();
+        }
+        locals[i] = arguments[i];
+      } else {
+        assert(function->isVar(i));
+        locals[i].type = function->getLocalType(i);
+      }
+    }
+  }
+};
+
+// Executes expressions together with a module instance
+template<typename ModuleInstance, typename SubType>
+class InstanceExpressionRunner : public ExpressionRunner<SubType> {
+  ModuleInstance& instance;
+  FunctionScope& scope;
+
+public:
+  InstanceExpressionRunner(ModuleInstance& instance, FunctionScope& scope) : instance(instance), scope(scope) {}
+
+  SubType* self() {
+    return static_cast<SubType*>(this);
+  }
+
+  Flow generateArguments(const ExpressionList& operands, LiteralList& arguments) {
+    NOTE_ENTER_("generateArguments");
+    arguments.reserve(operands.size());
+    for (auto expression : operands) {
+      Flow flow = self()->visit(expression);
+      if (flow.breaking()) return flow;
+      NOTE_EVAL1(flow.value);
+      arguments.push_back(flow.value);
+    }
+    return Flow();
+  }
+
+  Flow visitCall(Call *curr) {
+    NOTE_ENTER("Call");
+    NOTE_NAME(curr->target);
+    LiteralList arguments;
+    Flow flow = generateArguments(curr->operands, arguments);
+    if (flow.breaking()) return flow;
+    Flow ret = instance.callFunctionInternal(curr->target, arguments);
+#ifdef WASM_INTERPRETER_DEBUG
+    std::cout << "(returned to " << scope.function->name << ")\n";
+#endif
+    return ret;
+  }
+  Flow visitCallImport(CallImport *curr) {
+    NOTE_ENTER("CallImport");
+    LiteralList arguments;
+    Flow flow = generateArguments(curr->operands, arguments);
+    if (flow.breaking()) return flow;
+    return instance.externalInterface->callImport(instance.wasm.getImport(curr->target), arguments);
+  }
+  Flow visitCallIndirect(CallIndirect *curr) {
+    NOTE_ENTER("CallIndirect");
+    LiteralList arguments;
+    Flow flow = generateArguments(curr->operands, arguments);
+    if (flow.breaking()) return flow;
+    Flow target = self()->visit(curr->target);
+    if (target.breaking()) return target;
+    Index index = target.value.geti32();
+    return instance.externalInterface->callTable(index, arguments, curr->type, instance);
+  }
+
+  Flow visitGetLocal(GetLocal *curr) {
+    NOTE_ENTER("GetLocal");
+    auto index = curr->index;
+    NOTE_EVAL1(index);
+    NOTE_EVAL1(scope.locals[index]);
+    return scope.locals[index];
+  }
+  Flow visitSetLocal(SetLocal *curr) {
+    NOTE_ENTER("SetLocal");
+    auto index = curr->index;
+    Flow flow = self()->visit(curr->value);
+    if (flow.breaking()) return flow;
+    NOTE_EVAL1(index);
+    NOTE_EVAL1(flow.value);
+    assert(curr->isTee() ? flow.value.type == curr->type : true);
+    scope.locals[index] = flow.value;
+    return curr->isTee() ? flow : Flow();
+  }
+
+  Flow visitGetGlobal(GetGlobal *curr) {
+    NOTE_ENTER("GetGlobal");
+    auto name = curr->name;
+    NOTE_EVAL1(name);
+    NOTE_EVAL1(instance.globals[name]);
+    assert(instance.globals.find(name) != instance.globals.end());
+    return instance.globals[name];
+  }
+  Flow visitSetGlobal(SetGlobal *curr) {
+    NOTE_ENTER("SetGlobal");
+    auto name = curr->name;
+    Flow flow = self()->visit(curr->value);
+    if (flow.breaking()) return flow;
+    NOTE_EVAL1(name);
+    NOTE_EVAL1(flow.value);
+    instance.globals[name] = flow.value;
+    return Flow();
+  }
+
+  Flow visitLoad(Load *curr) {
+    NOTE_ENTER("Load");
+    Flow flow = self()->visit(curr->ptr);
+    if (flow.breaking()) return flow;
+    NOTE_EVAL1(flow);
+    auto addr = instance.getFinalAddress(curr, flow.value);
+    auto ret = instance.externalInterface->load(curr, addr);
+    NOTE_EVAL1(addr);
+    NOTE_EVAL1(ret);
+    return ret;
+  }
+  Flow visitStore(Store *curr) {
+    NOTE_ENTER("Store");
+    Flow ptr = self()->visit(curr->ptr);
+    if (ptr.breaking()) return ptr;
+    Flow value = self()->visit(curr->value);
+    if (value.breaking()) return value;
+    auto addr = instance.getFinalAddress(curr, ptr.value);
+    NOTE_EVAL1(addr);
+    NOTE_EVAL1(value);
+    instance.externalInterface->store(curr, addr, value.value);
+    return Flow();
+  }
+
+  Flow visitHost(Host *curr) {
+    NOTE_ENTER("Host");
+    switch (curr->op) {
+      case PageSize:   return Literal((int32_t)Memory::kPageSize);
+      case CurrentMemory: return Literal(int32_t(instance.memorySize));
+      case GrowMemory: {
+        auto fail = Literal(int32_t(-1));
+        Flow flow = self()->visit(curr->operands[0]);
+        if (flow.breaking()) return flow;
+        int32_t ret = instance.memorySize;
+        uint32_t delta = flow.value.geti32();
+        if (delta > uint32_t(-1) /Memory::kPageSize) return fail;
+        if (instance.memorySize >= uint32_t(-1) - delta) return fail;
+        uint32_t newSize = instance.memorySize + delta;
+        if (newSize > instance.wasm.memory.max) return fail;
+        instance.externalInterface->growMemory(instance.memorySize * Memory::kPageSize, newSize * Memory::kPageSize);
+        instance.memorySize = newSize;
+        return Literal(int32_t(ret));
+      }
+      case HasFeature: {
+        Name id = curr->nameOperand;
+        if (id == WASM) return Literal(1);
+        return Literal((int32_t)0);
+      }
+      default: abort();
+    }
+  }
+
+  void trap(const char* why) override {
+    instance.externalInterface->trap(why);
+  }
+};
+
+
 //
 // An instance of a WebAssembly module, which can execute it via AST interpretation.
 //
@@ -557,6 +742,8 @@ public:
   };
 
   Module& wasm;
+
+  ExternalInterface* externalInterface;
 
   // Values of globals
   std::map<Name, Literal> globals;
@@ -629,185 +816,6 @@ private:
 public:
   // Internal function call. Must be public so that callTable implementations can use it (refactor?)
   Literal callFunctionInternal(Name name, LiteralList& arguments) {
-
-    class FunctionScope {
-     public:
-      std::vector<Literal> locals;
-      Function* function;
-
-      FunctionScope(Function* function, LiteralList& arguments)
-          : function(function) {
-        if (function->params.size() != arguments.size()) {
-          std::cerr << "Function `" << function->name << "` expects "
-                    << function->params.size() << " parameters, got "
-                    << arguments.size() << " arguments." << std::endl;
-          abort();
-        }
-        locals.resize(function->getNumLocals());
-        for (size_t i = 0; i < function->getNumLocals(); i++) {
-          if (i < arguments.size()) {
-            assert(function->isParam(i));
-            if (function->params[i] != arguments[i].type) {
-              std::cerr << "Function `" << function->name << "` expects type "
-                        << printWasmType(function->params[i])
-                        << " for parameter " << i << ", got "
-                        << printWasmType(arguments[i].type) << "." << std::endl;
-              abort();
-            }
-            locals[i] = arguments[i];
-          } else {
-            assert(function->isVar(i));
-            locals[i].type = function->getLocalType(i);
-          }
-        }
-      }
-    };
-
-    // Executes expresions with concrete runtime info, the function and module at runtime
-    class RuntimeExpressionRunner : public ExpressionRunner<RuntimeExpressionRunner> {
-      ModuleInstance& instance;
-      FunctionScope& scope;
-
-    public:
-      RuntimeExpressionRunner(ModuleInstance& instance, FunctionScope& scope) : instance(instance), scope(scope) {}
-
-      Flow generateArguments(const ExpressionList& operands, LiteralList& arguments) {
-        NOTE_ENTER_("generateArguments");
-        arguments.reserve(operands.size());
-        for (auto expression : operands) {
-          Flow flow = visit(expression);
-          if (flow.breaking()) return flow;
-          NOTE_EVAL1(flow.value);
-          arguments.push_back(flow.value);
-        }
-        return Flow();
-      }
-
-      Flow visitCall(Call *curr) {
-        NOTE_ENTER("Call");
-        NOTE_NAME(curr->target);
-        LiteralList arguments;
-        Flow flow = generateArguments(curr->operands, arguments);
-        if (flow.breaking()) return flow;
-        Flow ret = instance.callFunctionInternal(curr->target, arguments);
-#ifdef WASM_INTERPRETER_DEBUG
-        std::cout << "(returned to " << scope.function->name << ")\n";
-#endif
-        return ret;
-      }
-      Flow visitCallImport(CallImport *curr) {
-        NOTE_ENTER("CallImport");
-        LiteralList arguments;
-        Flow flow = generateArguments(curr->operands, arguments);
-        if (flow.breaking()) return flow;
-        return instance.externalInterface->callImport(instance.wasm.getImport(curr->target), arguments);
-      }
-      Flow visitCallIndirect(CallIndirect *curr) {
-        NOTE_ENTER("CallIndirect");
-        LiteralList arguments;
-        Flow flow = generateArguments(curr->operands, arguments);
-        if (flow.breaking()) return flow;
-        Flow target = visit(curr->target);
-        if (target.breaking()) return target;
-        Index index = target.value.geti32();
-        return instance.externalInterface->callTable(index, arguments, curr->type, instance);
-      }
-
-      Flow visitGetLocal(GetLocal *curr) {
-        NOTE_ENTER("GetLocal");
-        auto index = curr->index;
-        NOTE_EVAL1(index);
-        NOTE_EVAL1(scope.locals[index]);
-        return scope.locals[index];
-      }
-      Flow visitSetLocal(SetLocal *curr) {
-        NOTE_ENTER("SetLocal");
-        auto index = curr->index;
-        Flow flow = visit(curr->value);
-        if (flow.breaking()) return flow;
-        NOTE_EVAL1(index);
-        NOTE_EVAL1(flow.value);
-        assert(curr->isTee() ? flow.value.type == curr->type : true);
-        scope.locals[index] = flow.value;
-        return curr->isTee() ? flow : Flow();
-      }
-
-      Flow visitGetGlobal(GetGlobal *curr) {
-        NOTE_ENTER("GetGlobal");
-        auto name = curr->name;
-        NOTE_EVAL1(name);
-        NOTE_EVAL1(instance.globals[name]);
-        assert(instance.globals.find(name) != instance.globals.end());
-        return instance.globals[name];
-      }
-      Flow visitSetGlobal(SetGlobal *curr) {
-        NOTE_ENTER("SetGlobal");
-        auto name = curr->name;
-        Flow flow = visit(curr->value);
-        if (flow.breaking()) return flow;
-        NOTE_EVAL1(name);
-        NOTE_EVAL1(flow.value);
-        instance.globals[name] = flow.value;
-        return Flow();
-      }
-
-      Flow visitLoad(Load *curr) {
-        NOTE_ENTER("Load");
-        Flow flow = visit(curr->ptr);
-        if (flow.breaking()) return flow;
-        NOTE_EVAL1(flow);
-        auto addr = instance.getFinalAddress(curr, flow.value);
-        auto ret = instance.externalInterface->load(curr, addr);
-        NOTE_EVAL1(addr);
-        NOTE_EVAL1(ret);
-        return ret;
-      }
-      Flow visitStore(Store *curr) {
-        NOTE_ENTER("Store");
-        Flow ptr = visit(curr->ptr);
-        if (ptr.breaking()) return ptr;
-        Flow value = visit(curr->value);
-        if (value.breaking()) return value;
-        auto addr = instance.getFinalAddress(curr, ptr.value);
-        NOTE_EVAL1(addr);
-        NOTE_EVAL1(value);
-        instance.externalInterface->store(curr, addr, value.value);
-        return Flow();
-      }
-
-      Flow visitHost(Host *curr) {
-        NOTE_ENTER("Host");
-        switch (curr->op) {
-          case PageSize:   return Literal((int32_t)Memory::kPageSize);
-          case CurrentMemory: return Literal(int32_t(instance.memorySize));
-          case GrowMemory: {
-            auto fail = Literal(int32_t(-1));
-            Flow flow = visit(curr->operands[0]);
-            if (flow.breaking()) return flow;
-            int32_t ret = instance.memorySize;
-            uint32_t delta = flow.value.geti32();
-            if (delta > uint32_t(-1) /Memory::kPageSize) return fail;
-            if (instance.memorySize >= uint32_t(-1) - delta) return fail;
-            uint32_t newSize = instance.memorySize + delta;
-            if (newSize > instance.wasm.memory.max) return fail;
-            instance.externalInterface->growMemory(instance.memorySize * Memory::kPageSize, newSize * Memory::kPageSize);
-            instance.memorySize = newSize;
-            return Literal(int32_t(ret));
-          }
-          case HasFeature: {
-            Name id = curr->nameOperand;
-            if (id == WASM) return Literal(1);
-            return Literal((int32_t)0);
-          }
-          default: abort();
-        }
-      }
-
-      void trap(const char* why) override {
-        instance.externalInterface->trap(why);
-      }
-    };
-
     if (callDepth > maxCallDepth) externalInterface->trap("stack limit");
     auto previousCallDepth = callDepth;
     callDepth++;
@@ -826,7 +834,12 @@ public:
     }
 #endif
 
-    Flow flow = RuntimeExpressionRunner(*this, scope).visit(function->body);
+    class ConcreteInstanceExpressionRunner : public InstanceExpressionRunner<ModuleInstance, ConcreteInstanceExpressionRunner> {
+    public:
+      ConcreteInstanceExpressionRunner(ModuleInstance& instance, FunctionScope& scope) : InstanceExpressionRunner(instance, scope) {}
+    };
+
+    Flow flow = ConcreteInstanceExpressionRunner(*this, scope).visit(function->body);
     assert(!flow.breaking() || flow.breakTo == RETURN_FLOW); // cannot still be breaking, it means we missed our stop
     Literal ret = flow.value;
     if (function->result == none) ret = Literal();
@@ -844,10 +857,6 @@ public:
 #endif
     return ret;
   }
-
-private:
-
-  Address memorySize; // in pages
 
   template <class LS>
   Address getFinalAddress(LS* curr, Literal ptr) {
@@ -868,7 +877,7 @@ private:
     return addr;
   }
 
-  ExternalInterface* externalInterface;
+  Address memorySize; // in pages
 };
 
 } // namespace wasm
